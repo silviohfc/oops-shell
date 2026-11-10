@@ -1,0 +1,150 @@
+#!/bin/sh
+# oops — toca um efeito sonoro quando você digita um comando errado.
+# Este script é chamado pelos hooks de cada shell (bash, zsh, fish) e
+# também pode ser usado diretamente para configurar o oops-shell.
+
+OOPS_HOME="${OOPS_HOME:-$HOME/.oops-shell}"
+CONFIG="$OOPS_HOME/config"
+SOUNDS_DIR="$OOPS_HOME/sounds"
+
+# Valores padrão (sobrescritos pelo arquivo de configuração)
+OOPS_ENABLED=1
+OOPS_SOUND=faah
+OOPS_MODE=notfound # notfound = só comando inexistente | error = qualquer erro
+OOPS_VOLUME=1      # 0.0 a 1.0 (usado quando o player suporta)
+
+# shellcheck source=/dev/null
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+save_config() {
+    cat >"$CONFIG" <<EOF
+# Configuração do oops-shell (edite à vontade ou use o comando 'oops')
+OOPS_ENABLED=$OOPS_ENABLED
+OOPS_SOUND=$OOPS_SOUND
+OOPS_MODE=$OOPS_MODE
+OOPS_VOLUME=$OOPS_VOLUME
+EOF
+}
+
+find_sound() {
+    for ext in wav mp3 aiff ogg m4a; do
+        if [ -f "$SOUNDS_DIR/$1.$ext" ]; then
+            printf '%s\n' "$SOUNDS_DIR/$1.$ext"
+            return 0
+        fi
+    done
+    return 1
+}
+
+list_sounds() {
+    for f in "$SOUNDS_DIR"/*; do
+        [ -f "$f" ] || continue
+        name=${f##*/}
+        printf '%s\n' "${name%.*}"
+    done | sort -u
+}
+
+# Toca o arquivo em segundo plano, sem prender o terminal.
+play_file() {
+    file=$1
+    if command -v afplay >/dev/null 2>&1; then
+        set -- afplay -v "$OOPS_VOLUME" "$file"
+    elif command -v paplay >/dev/null 2>&1; then
+        set -- paplay "$file"
+    elif command -v pw-play >/dev/null 2>&1; then
+        set -- pw-play --volume "$OOPS_VOLUME" "$file"
+    elif command -v aplay >/dev/null 2>&1 && [ "${file##*.}" = wav ]; then
+        set -- aplay -q "$file"
+    elif command -v ffplay >/dev/null 2>&1; then
+        set -- ffplay -nodisp -autoexit -loglevel quiet "$file"
+    elif command -v mpv >/dev/null 2>&1; then
+        set -- mpv --really-quiet --no-video "$file"
+    else
+        echo "oops: nenhum player de áudio encontrado (afplay, paplay, pw-play, aplay, ffplay ou mpv)" >&2
+        return 1
+    fi
+    nohup "$@" >/dev/null 2>&1 &
+}
+
+play_sound() {
+    name=${1:-$OOPS_SOUND}
+    if ! file=$(find_sound "$name"); then
+        echo "oops: som '$name' não encontrado em $SOUNDS_DIR" >&2
+        return 1
+    fi
+    play_file "$file"
+}
+
+# Decide se um código de saída deve disparar o som.
+should_play() {
+    status=$1
+    [ "$OOPS_ENABLED" = 1 ] || return 1
+    case $status in '' | *[!0-9]*) return 1 ;; esac
+    [ "$status" -eq 0 ] && return 1
+    [ "$status" -ge 128 ] && return 1 # interrompido por sinal (ex.: Ctrl+C)
+    case $OOPS_MODE in
+        error) return 0 ;;
+        *) [ "$status" -eq 127 ] || [ "$status" -eq 126 ] ;; # não encontrado / não executável
+    esac
+}
+
+usage() {
+    cat <<EOF
+oops — efeitos sonoros para comandos errados
+
+Uso:
+  oops status              Mostra a configuração atual
+  oops test [som]          Toca o som atual (ou o som informado)
+  oops list                Lista os sons disponíveis
+  oops sound <nome>        Define o som que será tocado
+  oops mode notfound       Toca só quando o comando não existe (padrão)
+  oops mode error          Toca em qualquer comando que falhar
+  oops volume <0.0-1.0>    Ajusta o volume (afplay/pw-play)
+  oops on | off            Liga ou desliga os sons
+  oops uninstall           Remove o oops-shell
+
+Para adicionar sons, coloque arquivos .wav/.mp3/.aiff/.ogg em:
+  $SOUNDS_DIR
+EOF
+}
+
+case $1 in
+    hook)
+        should_play "$2" && play_sound
+        exit 0
+        ;;
+    test | play) play_sound "$2" ;;
+    list)
+        list_sounds | while read -r s; do
+            if [ "$s" = "$OOPS_SOUND" ]; then echo "* $s"; else echo "  $s"; fi
+        done
+        ;;
+    sound)
+        [ -n "$2" ] || { usage >&2; exit 1; }
+        find_sound "$2" >/dev/null || { echo "oops: som '$2' não encontrado. Use 'oops list'." >&2; exit 1; }
+        OOPS_SOUND=$2 && save_config && echo "Som definido: $2"
+        ;;
+    mode)
+        case $2 in
+            notfound | error) OOPS_MODE=$2 && save_config && echo "Modo definido: $2" ;;
+            *) usage >&2; exit 1 ;;
+        esac
+        ;;
+    volume)
+        case $2 in
+            0 | 1 | 0.* | 1.0 | .*) OOPS_VOLUME=$2 && save_config && echo "Volume definido: $2" ;;
+            *) echo "oops: volume deve estar entre 0.0 e 1.0" >&2; exit 1 ;;
+        esac
+        ;;
+    on) OOPS_ENABLED=1 && save_config && echo "oops-shell ligado" ;;
+    off) OOPS_ENABLED=0 && save_config && echo "oops-shell desligado" ;;
+    status)
+        echo "Ligado: $([ "$OOPS_ENABLED" = 1 ] && echo sim || echo não)"
+        echo "Som:    $OOPS_SOUND"
+        echo "Modo:   $OOPS_MODE"
+        echo "Volume: $OOPS_VOLUME"
+        ;;
+    uninstall) exec sh "$OOPS_HOME/uninstall.sh" ;;
+    '' | -h | --help | help) usage ;;
+    *) usage >&2; exit 1 ;;
+esac
